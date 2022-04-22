@@ -77,13 +77,15 @@ struct Entities {
     void updateDangerousMonsters() {
         int maxSimulationDepth = 8;
         int baseDangerousRadius = cBaseRadius;
+        set<int> accountedIdxs;
         for (int simulationDepth = 0; simulationDepth < maxSimulationDepth; simulationDepth++) {
             // simulate monster pos for simulationDepth iteration
             for (const Entity& monster : monsters) {
                 Coord simulatedCoord{ monster.coords.x + simulationDepth * monster.vx, monster.coords.y + simulationDepth * monster.vy };
                 double distToBase = dist(simulatedCoord, baseCoords);
-                if (distToBase < baseDangerousRadius) {
+                if (distToBase < baseDangerousRadius && !accountedIdxs.count(monster.id)) {
                     dangerousMonsters.push_back(monster);
+                    accountedIdxs.insert(monster.id);
                     dangerousMonsters.back().importance = cMaxDist - distToBase + (maxSimulationDepth - simulationDepth - 1) * 2500.;
                 }
             }
@@ -103,12 +105,12 @@ struct Entities {
                         abs(baseCoords.y - static_cast<int>(ceil(cBaseRadius * 0.8 * sin(22.5 * M_PI / 180.)))) }
             },
             vector<Coord> {
-                Coord{  abs(static_cast<int>(ceil(baseCoords.x - cBaseRadius) * 0.8)), 
+                Coord{  abs(static_cast<int>(ceil(baseCoords.x - cBaseRadius) * 0.8)),
                         abs(static_cast<int>(ceil(baseCoords.y - cBaseRadius) * 0.8)) },
-                Coord{  abs(baseCoords.x - static_cast<int>( ceil(cBaseRadius * 0.8 * cos(67.5 * M_PI / 180.)) )), 
-                        abs(baseCoords.y - static_cast<int>( ceil(cBaseRadius * 0.8 * sin(67.5 * M_PI / 180.)) )) },
-                Coord{  abs(baseCoords.x - static_cast<int>( ceil(cBaseRadius * 0.8 * cos(22.5 * M_PI / 180.)) )),
-                        abs(baseCoords.y - static_cast<int>( ceil(cBaseRadius * 0.8 * sin(22.5 * M_PI / 180.)) )) }
+                Coord{  abs(baseCoords.x - static_cast<int>(ceil(cBaseRadius * 0.8 * cos(67.5 * M_PI / 180.)))),
+                        abs(baseCoords.y - static_cast<int>(ceil(cBaseRadius * 0.8 * sin(67.5 * M_PI / 180.)))) },
+                Coord{  abs(baseCoords.x - static_cast<int>(ceil(cBaseRadius * 0.8 * cos(22.5 * M_PI / 180.)))),
+                        abs(baseCoords.y - static_cast<int>(ceil(cBaseRadius * 0.8 * sin(22.5 * M_PI / 180.)))) }
             }
         };
     }
@@ -120,6 +122,7 @@ struct Entities {
         for (size_t targetIdx = 0; targetIdx < min(3, static_cast<int>(dangerousMonsters.size())); targetIdx++)
         {
             bestTargets.push_back(dangerousMonsters[targetIdx].coords);
+            cerr << "Best target idx" << targetIdx << ": id " << dangerousMonsters[targetIdx].id << " (" << bestTargets.back().x << ", " << bestTargets.back().y << ")" << endl;
         }
 
         return bestTargets;
@@ -137,7 +140,21 @@ int main() {
 
         entities.updateDangerousMonsters();
 
-        vector<Coord> bestTargets = entities.getBestTargets();
+        if (vector<Coord> bestTargets = entities.getBestTargets(); bestTargets.size() != 0)
+        {
+            for (int i = 0; i < heroesNb; i++)
+            {
+                cout << "MOVE " << bestTargets[0].x << " " << bestTargets[0].y << endl;
+            }
+        }
+        else
+        {
+            for (const Coord& waitCoord : waitCoordsVec2[2]) {
+                cout << "MOVE " << waitCoord.x << " " << waitCoord.y << endl;
+            }
+        }
+
+        /*
         for (size_t targetIdx = 0; targetIdx < bestTargets.size(); targetIdx++) {
             cout << "MOVE " << bestTargets[targetIdx].x << " " << bestTargets[targetIdx].y << endl;
         }
@@ -147,6 +164,6 @@ int main() {
                 cout << "MOVE " << waitCoord.x << " " << waitCoord.y << endl;
             }
         }
-
+        */
     }
 }
