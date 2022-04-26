@@ -68,7 +68,7 @@ bool entityCompare(const Entity& left, const Entity& right) {
 
 struct Entities {
     vector<Entity> our, enemies, monsters;
-    Coord baseCoords;
+    Coord baseCoords, enemyBaseCoords;
     int entitiesNb;
     Entity tempEntity;
 
@@ -79,6 +79,7 @@ struct Entities {
     void readBaseCoords() {
         cin >> baseCoords.x >> baseCoords.y; cin.ignore();
         waitCoordsVec2 = getWaitCoords();
+        enemyBaseCoords = { maxCoord.x - baseCoords.x, maxCoord.y - baseCoords.y };
     }
 
     void read() {
@@ -141,9 +142,11 @@ struct Entities {
                     monster.distanceToBase += Entity::cMonsterSpeed;
                     monster.stepsToBase++;
 
-                    if (distToBase < 500) {
+                    // если по результатам симуляции монстр дошел до базы - считаем его опасным
+                    if (distToBase < 500 && monster.distanceToBase < 8000) {
                         monster.importance = (maxSimulationDepth - simulationDepth - 1) * 2500.;
-                        monster.neededUnitsNb = static_cast<int>(std::ceil(static_cast<double>(monster.health) / (monster.stepsToBase * Entity::cUnitDamage))) + 1;
+                        bool needAdditionalUnit = (simulationDepth < 10) || monster.shieldLife;
+                        monster.neededUnitsNb = static_cast<int>(std::ceil(static_cast<double>(monster.health) / (monster.stepsToBase * Entity::cUnitDamage))) + (needAdditionalUnit ? 1 : 0);
 
                         accountedDangeroudIdxs.insert(monster.id);
                         dangerousMonsters.push_back(monster);
@@ -155,7 +158,7 @@ struct Entities {
 
         // сохраняем монстров, которые не представляют угрозы, чтобы пофармить их если буду свободные юниты
         for (Entity& monster : monsters) {
-            if (!accountedDangeroudIdxs.count(monster.id)) {
+            if (!accountedDangeroudIdxs.count(monster.id) && monster.distanceToBase < 8000) {
                 monster.importance = (cMaxDist - dist(monster.coords, baseCoords)) * 2500. / cMaxDist;
                 undangerousMonsters.push_back(monster);
             }
@@ -181,12 +184,12 @@ struct Entities {
 
             for (int neededUnitIdx = 0; neededUnitIdx < monster.neededUnitsNb; neededUnitIdx++) {
                 // ищем ближайшего юнита к данному монстру
-                double bestDist = cMaxDist, curDist;
+                double bestDistBetweenUnitAndMonster = cMaxDist, curDist;
                 int bestOurUnitId = -1;
                 for (Entity& ourUnit : our) {
                     curDist = dist(ourUnit.coords, monster.coords);
-                    if (curDist < bestDist) {
-                        bestDist = curDist;
+                    if (curDist < bestDistBetweenUnitAndMonster) {
+                        bestDistBetweenUnitAndMonster = curDist;
                         bestOurUnitId = ourUnit.id;
                     }
                 }
@@ -196,9 +199,19 @@ struct Entities {
                 // определяем индекс юнита (команды)
                 int commandIdx = bestOurUnitId - (bestOurUnitId >= 3 ? 3 : 0);
 
-                // добавляем команду на атаку ближайшим юнитом этого монстра
-                // ТУТ МОЖНО ДОБАВИТЬ ВЕТЕРОК, ЕСЛИ МОНСТР НЕ МЕЖДУ БАЗОЙ И ЮНИТОМ
-                actions[commandIdx] = { "MOVE", monster.coords.x, monster.coords.y };
+                // если юнит ближе к базе чем монстр И дальность до монстра меньша дальности ветерка И дальность от базы < 7500 (обдумать эвристику)
+                // то пытаемся выдувать монстра подальше
+                double bestUnitDistToBase = dist(our[commandIdx].coords, baseCoords),
+                       monsterDistToBase = dist(monster.coords, baseCoords);
+                if (bestUnitDistToBase < monsterDistToBase + (1280./2.)
+                    && bestDistBetweenUnitAndMonster < (1280. / 2.)
+                    && monsterDistToBase < 7500.) {
+                    actions[commandIdx] = { "SPELL WIND", enemyBaseCoords.x, enemyBaseCoords.y };
+                }
+                // иначе идем с опережением монстра
+                else {
+                    actions[commandIdx] = { "MOVE", monster.coords.x + monster.vx, monster.coords.y + monster.vy };
+                }
 
                 // удаляем выбранного юнита из доступных для хода
                 for (int i = 0; i < our.size(); i++) {
@@ -221,13 +234,13 @@ struct Entities {
 
                 for (const Entity& undangerousMonster: undangerousMonsters) {
                     // ищем ближайшего юнита к данному монстру
-                    double bestDist = cMaxDist, curDist;
+                    double bestDistBetweenUnitAndMonster = cMaxDist, curDist;
                     int bestOurUnitId = -1;
 
                     for (Entity& ourUnit : our) {
                         curDist = dist(ourUnit.coords, undangerousMonster.coords);
-                        if (curDist < bestDist) {
-                            bestDist = curDist;
+                        if (curDist < bestDistBetweenUnitAndMonster) {
+                            bestDistBetweenUnitAndMonster = curDist;
                             bestOurUnitId = ourUnit.id;
                         }
                     }
@@ -257,16 +270,18 @@ struct Entities {
             }
         }
 
-        // если на расстоянии 2-3 ходов от базы есть монстр, для убийства которого нужно 3 героя
-        // 
-        // если САМЫЙ ОПАСНЫЙ монстр на расстоянии 3 хода от базы
+        // если САМЫЙ ОПАСНЫЙ монстр на расстоянии 3 хода от базы И на нем нет щитка
         // то берем ближайшего героя к базе и принудительно ведем его точке на расстоянии 300 от базы под 45 градусов
         // как только этот юнит будет ближе всех остальных юнитов и монстров к базе - этот юнит юзает ветерок
+        /*
         if (dangerousMonsters.size()) {
 
             double mostDangerMonsterDistToBase = dist(dangerousMonsters[0].coords, baseCoords);
+            bool canBeWinded = !dangerousMonsters[0].shieldLife;
+
+            // расстояние на котором считаем целесообразным применять ветерок
             double windActionsThreshold = 5 * 400.;
-            if (mostDangerMonsterDistToBase < windActionsThreshold) {
+            if (mostDangerMonsterDistToBase < windActionsThreshold && canBeWinded) {
                 // ищем ближайшего юнита к базе
                 double bestUnitDist = cMaxDist, curDist;
                 int bestOurUnitId = -1;
@@ -286,20 +301,21 @@ struct Entities {
 
                 // если юнит уже ближе к базе чем монстр и расстояние до монстра < 1280, то дуем
                 if ((bestUnitDist < mostDangerMonsterDistToBase) && (dist(dangerousMonsters[0].coords, safetyOur[commandIdx].coords) < 1280)) {
-                    actions[commandIdx] = { "SPELL WIND", dangerousMonsters[0].coords.x, dangerousMonsters[0].coords.y };
+                    actions[commandIdx] = { "SPELL WIND", enemyBaseCoords.x, enemyBaseCoords.y };
                 }
                 else {
                     // если юнит еще далеко, то пытаемся обогнать монстра
-                    actions[commandIdx] = { "MOVE", baseCoords.x, baseCoords.y };
+                    actions[commandIdx] = { "MOVE", dangerousMonsters[0].coords.x + dangerousMonsters[0].vx, dangerousMonsters[0].coords.y + dangerousMonsters[0].vy };
                 }
             }
         }
+        */
 
         return actions;
     }
 
     vector<vector<Coord>> getWaitCoords() {
-        static const double defendRadiusCoef = 1.35;
+        static const double defendRadiusCoef = 1.15;
 
         // cerr << "Base coords: " << baseCoords.x << " " << baseCoords.y << endl;
 
