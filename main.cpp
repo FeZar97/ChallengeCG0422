@@ -91,7 +91,7 @@ void eraseFromVecUnitId(int id, vector<Entity>& vec) {
     }
 }
 int getWindCastAllowRadius() {
-    return 5000 + 1000 * bases.ourBase.mana / 20;
+    return 5000 + 1000 * bases.ourBase.mana / 40;
 }
 
 struct Entities {
@@ -239,7 +239,7 @@ struct Entities {
                     // cerr << "Monster type Enemy" << endl;
                     // cerr << "\tEnemy dangerous entity, bestUnitDistToBase:" << bestUnitDistToBase << ", monsterDistToBase:" << monsterDistToBase << endl;
                     // cerr << "\t\tdistBetweenUnitAndMonster:" << distBetweenUnitAndMonster << endl;
-                    if (distBetweenUnitAndMonster < cHalfWindWide * 1.5) {
+                    if (distBetweenUnitAndMonster < cHalfWindWide) {
                         actions[bestOurUnitId] = { "SPELL WIND", enemyBaseCoords.x, enemyBaseCoords.y };
                     }
                     // иначе идем с опережением врага
@@ -251,7 +251,9 @@ struct Entities {
                 else if (bestUnitDistToBase < monsterDistToBase + cHalfWindWide // если наш юнит БЛИЖЕ к базе чем монстр на половину каста ветерка
                     && distBetweenUnitAndMonster < cHalfWindWide
                     && monsterDistToBase < getWindCastAllowRadius()
-                    && !monster.shieldLife) {
+                    && !monster.shieldLife // нет смысла сдувать монстров с щитом
+                    && neededUnitIdx == 0 // сдувом будет заниматься только ближайший юнит
+                    ) {
                     // cerr << "Monster type Monster, can cast WIND" << endl;
                     actions[bestOurUnitId] = { "SPELL WIND", enemyBaseCoords.x, enemyBaseCoords.y };
                 }
