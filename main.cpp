@@ -335,7 +335,7 @@ struct Entities {
                 if (mostDangerousEnemyMonster.needShield
                     && distBetweenUnitAndMonster < 2200.
                     && !mostDangerousEnemyMonster.shieldLife) {
-                    actions[Attacker] = { "SPELL SHILD", enemyBaseCoords.x, enemyBaseCoords.y };
+                    actions[Attacker] = { "SPELL SHIELD", mostDangerousEnemyMonster.id };
                 }
                 // пытаемся задувать монстра вглубь базы врага
                 else if (mostDangerousEnemyMonster.needWind
