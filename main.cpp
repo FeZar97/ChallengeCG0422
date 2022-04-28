@@ -30,8 +30,13 @@ const int cUnitDamage = 2;
 int turnCnt = 0;
 const int cMaxTurnIdx = 219;
 const int cWindWidth = 1280;
+const int cHalfWindWidth = cWindWidth / 2;
 const int cWindDistance = 2200;
-const int cHalfWindWide = cWindWidth / 2;
+const int cHalfWindDistance = cWindDistance / 2;
+const int cMaxSimulationDepth = 35;
+const double cDistanceThresholdWhenEnemyReachBase = 500.; // расстояние, на котором считается, что монстр достиг базы
+const double cDangerousDistanceThreshold = 9000.; // порог криволинейного расстояния до нашей базы, после которого монстр считается ОПАСНЫМ для нас
+const double cImportanceStep = 2500.; // важность монстра, уменьшающаяся с каждым ходом на величину шага
 
 struct BaseStats {
     int health, mana;
@@ -53,10 +58,13 @@ struct Entity {
     Coord coords;
 
     double importance{ 0. };
-    double distanceToBase{ 0. };
+    double distanceToReachBase{ 0. };
     int stepsToBase{ 0 };
     int neededUnitsNb{ 0 }; // МИНИМАЛЬНОЕ количество юнитов, требующееся для убийства монстра
     Coord simulatedCoords;
+    double minDistanceToBase{ cMaxDist }; // минимальное расстояние до базы, которого достигнет монстр за все симуляции (положительное для нашей базы, отрицательное - для вражеской)
+
+    bool needShield = false, needWind = false;
 
     void read() {
         cin >> id >> type >> coords.x >> coords.y >> shieldLife >> isControlled >> health >> vx >> vy >> nearBase >> threatFor; cin.ignore();
@@ -94,25 +102,34 @@ int getWindCastAllowRadius() {
     return 5000 + 1000 * bases.ourBase.mana / 40;
 }
 
+enum UNIT_TYPES {
+    Defender,
+    Attacker,
+    Farmer
+};
+
 struct Entities {
     vector<Entity> our, enemies, monsters;
-    Coord baseCoords, enemyBaseCoords;
+    Coord ourBaseCoords, enemyBaseCoords;
     int entitiesNb;
-    Entity tempEntity;
 
-    vector<Entity> dangerousMonsters, undangerousMonsters;
-    vector<vector<Coord>> waitCoordsVec2;
+    vector<Coord> attackCoordsVec, farmCoordVec;
+    int farmerCurrentTargetPos = -1,
+        attackerCurrentTargetPos = -1,
+        defenderCurrentTargetPos = -1;
 
     void readBaseCoords() {
-        cin >> baseCoords.x >> baseCoords.y; cin.ignore();
-        waitCoordsVec2 = getWaitCoords();
-        enemyBaseCoords = { maxCoord.x - baseCoords.x, maxCoord.y - baseCoords.y };
+        cin >> ourBaseCoords.x >> ourBaseCoords.y; cin.ignore();
+        enemyBaseCoords = { maxCoord.x - ourBaseCoords.x, maxCoord.y - ourBaseCoords.y };
+        attackCoordsVec = getAttackDefaultCoords();
+        farmCoordVec = getFarmDefaultCoords();
     }
 
     void read() {
-        monsters.clear(); our.clear(); enemies.clear(); dangerousMonsters.clear(); undangerousMonsters.clear();
+        monsters.clear(); our.clear(); enemies.clear();
         cin >> entitiesNb; cin.ignore();
         for (int entityId = 0; entityId < entitiesNb; entityId++) {
+            Entity tempEntity;
             tempEntity.read();
             switch (tempEntity.type) {
             case Monster: monsters.push_back(tempEntity); break;
@@ -123,224 +140,420 @@ struct Entities {
         }
     }
 
-    Actions updateDangerousMonsters() {
-        int maxSimulationDepth = 35;
+    Actions prepairActions() {
+
+        vector<Entity> ourDangerousMonsters, enemyDangerousMonsters, monstersToFarmingAndEnemyUnits,
+                       safetyOur(our.begin(), our.end());
+        set<int> ourDangerousAccountedMonsters, // учтенные в расчете дистанции до базы (попадают в этот сет, когда расстояние до базы <= 400)
+                 enemyDangerousAccountedMonsters,
+                 accountedEnemyUnits;
 
         for (Entity& monster : monsters) {
             monster.simulatedCoords = monster.coords;
         }
-        vector<Entity> safetyOur;
-        for (const Entity& ourUnit : our) {
-            safetyOur.push_back(ourUnit);
-        }
 
-        set<int> accountedInDangeroudIdxs; // учтенные в расчете дистанции до базы (попадают в этот сет, когда расстояние до базы <= 400)
-        for (int i = 0; i < enemies.size(); i++) {
-            double curStepDist = dist(enemies[i].coords, baseCoords),
-                   nextStepDist = dist({ enemies[i].coords.x + enemies[i].vx, enemies[i].coords.y + enemies[i].vy }, baseCoords);
+        // заносим опасных вражеских юнитов в вектор с монстрами
+        {
+            for (int i = 0; i < enemies.size(); i++) {
+                double curStepDist = dist(enemies[i].coords, ourBaseCoords),
+                    nextStepDist = dist({ enemies[i].coords.x + enemies[i].vx, enemies[i].coords.y + enemies[i].vy }, ourBaseCoords);
 
-            // если враг на нашей половине и идет В СТОРОНУ нашей базы
-            if ((curStepDist < cMaxDist / 2) && (nextStepDist < curStepDist)) {
-                // cerr << "Enemy " << enemies[i].id << " is danger for our base" << endl;
-                monsters.push_back(enemies[i]);
+                // если враг на нашей половине и идет В СТОРОНУ нашей базы
+                if ((curStepDist < cMaxDist / 2) && (nextStepDist < curStepDist)) {
+                    // cerr << "Enemy " << enemies[i].id << " is danger for our base" << endl;
+                    monsters.push_back(enemies[i]);
+                }
             }
         }
-        for (int simulationDepth = 0; simulationDepth < maxSimulationDepth; simulationDepth++) {
-            for (Entity& monster : monsters) {
-                monster.simulatedCoords.x += monster.vx;
-                monster.simulatedCoords.y += monster.vy;
 
-                double distToBase = dist(monster.simulatedCoords, baseCoords);
+        // симуляция движений видимых сущностей
+        {
+            double curDistToOurBase, curDistToEnemyBase;
+            for (int simulationDepth = 0; simulationDepth < cMaxSimulationDepth; simulationDepth++) {
+                for (Entity& monster : monsters) {
 
-                // меняеем вектор скорости, когда монстр заходит в радиус базы
-                if (distToBase < cBaseRadius)
-                {
-                    int dBaseX = baseCoords.x - monster.simulatedCoords.x,
-                        dBaseY = baseCoords.y - monster.simulatedCoords.y;
-                    monster.vx = ceil(cMonsterSpeed * dBaseX / distToBase);
-                    monster.vy = ceil(cMonsterSpeed * dBaseY / distToBase);
+                    // симулируем координаты монстра и учитываем его дистанции
+                    {
+                        monster.simulatedCoords.x += monster.vx;
+                        monster.simulatedCoords.y += monster.vy;
 
-                    // cerr << "On simulation " << simulationDepth << " monster " << monster.id << " speed: " << monster.vx << " " << monster.vy << endl;
-                }
+                        // дистанция до баз на i-м шаге симуляция
+                        curDistToOurBase = dist(monster.simulatedCoords, ourBaseCoords);
+                        curDistToEnemyBase = dist(monster.simulatedCoords, enemyBaseCoords);
 
-                // отдельно обрабатываем пушеров врага
-                // достаточное условие реакции на такого юнита - достижение им радиуса базы
-                if (monster.type == Enemy && distToBase < cBaseRadius && !accountedInDangeroudIdxs.count(monster.id)) {
-                    monster.importance = (cMaxDist / 2. - dist(monster.coords, baseCoords)) * 3500.;
-                    monster.neededUnitsNb = 1;
+                        // сохраняем минимальные дистанции за все симуляции
+                        if (curDistToOurBase < abs(monster.minDistanceToBase)) monster.minDistanceToBase = curDistToOurBase;
+                        if (curDistToEnemyBase < abs(monster.minDistanceToBase)) monster.minDistanceToBase = -curDistToEnemyBase;
+                    }
 
-                    // cerr << "Enemy " << monster.id << " importance: " << monster.importance << endl;
-                    accountedInDangeroudIdxs.insert(monster.id);
-                    dangerousMonsters.push_back(monster);
-                }
-                // остальные кейсы - обычные монстры
-                // добавляем дистанцию к общей дистанции до базы за тот ход, который симулируем
-                // если монстр у базы, то для него в последующих симуляциях не надо считать дистанцию
-                else if (!accountedInDangeroudIdxs.count(monster.id)) {
-                    monster.distanceToBase += cMonsterSpeed;
-                    monster.stepsToBase++;
+                    // меняеем вектор скорости, когда монстр заходит в радиус базы
+                    {
+                        if (curDistToOurBase < cBaseRadius)
+                        {
+                            int dBaseX = ourBaseCoords.x - monster.simulatedCoords.x, // важно чтобы значения могли быть отрицательным
+                                dBaseY = ourBaseCoords.y - monster.simulatedCoords.y; // для правильных значений компонент скорости
+                            monster.vx = ceil(cMonsterSpeed * dBaseX / curDistToOurBase);
+                            monster.vy = ceil(cMonsterSpeed * dBaseY / curDistToOurBase);
+                        }
+                        if (curDistToEnemyBase < cBaseRadius)
+                        {
+                            int dBaseX = enemyBaseCoords.x - monster.simulatedCoords.x, // важно чтобы значения могли быть отрицательным
+                                dBaseY = enemyBaseCoords.y - monster.simulatedCoords.y; // для правильных значений компонент скорости
+                            monster.vx = ceil(cMonsterSpeed * dBaseX / curDistToEnemyBase);
+                            monster.vy = ceil(cMonsterSpeed * dBaseY / curDistToEnemyBase);
+                        }
+                        // cerr << "On simulation " << simulationDepth << " monster " << monster.id << " speed: " << monster.vx << " " << monster.vy << endl;
+                    }
 
-                    // если по результатам симуляции монстр дошел до базы - считаем его опасным
-                    if (distToBase < 500 && monster.distanceToBase < 9000) {
-                        monster.importance = (maxSimulationDepth - simulationDepth - 1) * 2500.;
-                        bool needAdditionalUnit = (simulationDepth < 8) || monster.shieldLife;
-                        monster.neededUnitsNb = static_cast<int>(std::ceil(static_cast<double>(monster.health) / (monster.stepsToBase * cUnitDamage))) + (needAdditionalUnit ? 1 : 0);
+                    // проверяем наличие вражеских пушеров
+                    {
+                        // достаточное условие реакции на такого юнита - достижение им радиуса базы
+                        if (monster.type == Enemy
+                            && curDistToOurBase < cBaseRadius
+                            && !accountedEnemyUnits.count(monster.id)) {
+                            monster.importance = (cMaxDist / 2. - dist(monster.coords, ourBaseCoords)) * 3500.;
+                            monster.neededUnitsNb = 1;
 
-                        // err << "Monster " << monster.id << " importance: " << monster.importance << " neededUnits: " << monster.neededUnitsNb << endl;
+                            // cerr << "Enemy " << monster.id << " importance: " << monster.importance << endl;
+                            accountedEnemyUnits.insert(monster.id);
+                            monstersToFarmingAndEnemyUnits.push_back(monster);
+                        }
+                    }
 
-                        accountedInDangeroudIdxs.insert(monster.id);
-                        dangerousMonsters.push_back(monster);
+                    // учет положений и состояний пауков
+                    {
+                        // добавляем дистанцию к общей дистанции до базы за тот ход, который симулируем
+                        if (!ourDangerousAccountedMonsters.count(monster.id)
+                            && !enemyDangerousAccountedMonsters.count(monster.id)) {
+                            monster.distanceToReachBase += cMonsterSpeed;
+                            monster.stepsToBase++;
+
+                            // если по результатам симуляции монстр дошел до базы - считаем его опасным
+                            
+                            // ДЛЯ НАШЕЙ БАЗЫ
+                            if (curDistToOurBase < cDistanceThresholdWhenEnemyReachBase
+                                && monster.distanceToReachBase < cDangerousDistanceThreshold) {
+                                monster.importance = (cMaxSimulationDepth - simulationDepth - 1) * cImportanceStep;
+
+                                ourDangerousAccountedMonsters.insert(monster.id);
+                                ourDangerousMonsters.push_back(monster);
+                            }
+                            // ДЛЯ ВРАЖЕСКОЙ БАЗЫ
+                            // флаг, означающий, что монстр сам атакует базу и ему можно будет помочь
+                            bool selfAttackedEnemyBase =
+                                (curDistToEnemyBase < cDistanceThresholdWhenEnemyReachBase) // если монстр все же достигнет вражеской базы
+                                && (monster.distanceToReachBase < cDangerousDistanceThreshold) // и если это будет в обозримом будущем
+                                && (monster.stepsToBase < 20); // и щиток у монстра кончится раньше, чем он достигнет базы, чтобы его можно было задуть
+                            // cerr << "Entity " << monster.id << " is selfAttackedEnemyBase: " << selfAttackedEnemyBase << endl;
+                            // с этим флагом расчет важности монстра производится по формуле, зависящей от номера симуляции
+                            if (selfAttackedEnemyBase) {
+                                monster.importance = (cMaxSimulationDepth - simulationDepth - 1) * cImportanceStep;
+                                monster.needShield = true;
+                                enemyDangerousAccountedMonsters.insert(monster.id);
+                                enemyDangerousMonsters.push_back(monster);
+                            }
+                            // флаг, означающий, что монстра можно сдуть с ТЕКУЩЕЙ позиции в радиус
+                            bool canBeMovedToEnemyBase =
+                                   (simulationDepth <= 2)
+                                && (curDistToEnemyBase < 6700.)
+                                && (!monster.shieldLife);
+                            // cerr << "Entity " << monster.id << " is canBeMovedToEnemyBase: " << selfAttackedEnemyBase << endl;
+                            if (canBeMovedToEnemyBase) {
+                                double distanceBetweenAttackerAndMonster = dist(monster.simulatedCoords, our[Attacker].coords);
+                                monster.importance = (5000. - distanceBetweenAttackerAndMonster) * cImportanceStep;
+                                monster.needWind = true;
+                                enemyDangerousAccountedMonsters.insert(monster.id);
+                                enemyDangerousMonsters.push_back(monster);
+                            }
+                        }
                     }
                 }
             }
         }
 
-        // сохраняем монстров, которые не представляют угрозы, чтобы пофармить их если будут свободные юниты
-        for (Entity& monster : monsters) {
-            // cerr << "Monster with id " << monster.id << " is accounted in dangerous: " << accountedInDangeroudIdxs.count(monster.id) << endl;
-            if (!accountedInDangeroudIdxs.count(monster.id) && dist(monster.coords, baseCoords) < 8500.) {
-                monster.importance = (cMaxDist - dist(monster.coords, baseCoords)) * 2500. / cMaxDist;
-                undangerousMonsters.push_back(monster);
+        // учет монстров, которых можно пофармить
+        {
+            for (Entity& monster : monsters) {
+                if (!ourDangerousAccountedMonsters.count(monster.id) // если монстр не опасный для нас
+                    && !ourDangerousAccountedMonsters.count(monster.id) // и монстр не опасный для врага
+                    && monster.minDistanceToBase < 8500. // считаем пригодным для фарма, если он проходит от НАШЕЙ базы на расстоянии <8500
+                    && monster.minDistanceToBase > -1000. // фармим с небольшим запасом по дистанции от нашей половины карты, что юнит не уходил далеко
+                    && monster.type == EntityType::Monster) {
+                    // важность монстра считается по его ТЕКУЩЕМУ положению
+                    monster.importance = (cMaxDist - dist(monster.coords, ourBaseCoords)) * 2500. / cMaxDist;
+                    monstersToFarmingAndEnemyUnits.push_back(monster);
+                }
             }
         }
 
         // сортировка по важности
-        sort(dangerousMonsters.begin(), dangerousMonsters.end(), entityCompare);
-        sort(undangerousMonsters.begin(), undangerousMonsters.end(), entityCompare);
-        // cerr << "Sorting completed" << endl;
-        // cerr << "Wind Cast Allow Radius: " << getWindCastAllowRadius() << endl;
-        // cerr << "Dangerous:" << endl;
-        // for (const Entity& monster : dangerousMonsters) {
-        //     cerr << "\t\tEntity " << monster.id << ", importance: " << monster.importance << endl;
-        // }
+        {
+            sort(ourDangerousMonsters.begin(), ourDangerousMonsters.end(), entityCompare);
+            sort(enemyDangerousMonsters.begin(), enemyDangerousMonsters.end(), entityCompare);
+            sort(monstersToFarmingAndEnemyUnits.begin(), monstersToFarmingAndEnemyUnits.end(), entityCompare);
 
-        // формируем ходы для юнитов на основании важности монстра и количества юнитов, которое необходимо для его убийства
+            // cerr << "Sorting completed" << endl;
+            // cerr << "Wind Cast Allow Radius: " << getWindCastAllowRadius() << endl;
+
+            /*
+            cerr << "Our Dangerous:" << endl;
+            for (const Entity& monster : ourDangerousMonsters) {
+                cerr << "\t\tEntity " << monster.id << ", importance: " << monster.importance << endl;
+            }
+            */
+
+            /*
+            cerr << "Enemy Dangerous:" << endl;
+            for (const Entity& monster : enemyDangerousMonsters) {
+                cerr << "\t\tEntity " << monster.id << ", importance: " << monster.importance << endl;
+            }
+            */
+        }
+
+        // формируем ходы
         Actions actions;
         actions.resize(3);
-        for (Entity& monster : dangerousMonsters) {
+        {
+        // если нет целей для атакера и дефендера, то они занимаются фармом
+        bool isDefenderBusy = !ourDangerousMonsters.empty(),
+            isAttackerBusy = !enemyDangerousMonsters.empty(),
+            // isFarmerBusy = !monstersToFarmingAndEnemyUnits.empty();
+            isFarmerBusy = ourDangerousMonsters.size() > 1;
 
-            // cerr << "Monster with id " << monster.id << " has importance " << monster.importance
-            //     << ", dist to base " << monster.distanceToBase << ", stepsToBase " << monster.stepsToBase
-            //     << " and need units: " << monster.neededUnitsNb << endl;
+        // формируем ход для ATTACKER
+        {
+            if (isAttackerBusy) {
+                attackerCurrentTargetPos = -1;
+                double attackerDistToBase = dist(our[Attacker].coords, enemyBaseCoords);
+                // самый опасный монстр
+                const Entity& mostDangerousEnemyMonster = enemyDangerousMonsters.front();
 
-            for (int neededUnitIdx = 0; neededUnitIdx < monster.neededUnitsNb; neededUnitIdx++) {
-                // ищем ближайшего юнита к данному монстру
-                int bestOurUnitId = convertToArrayIdx(getIdxOfNearestUnits(monster.coords, our));
-                // cerr << "\tBest our unit for dangerous entity " << monster.id << " is " << bestOurUnitId << endl;
+                double monsterDistToEnemyBase = dist(mostDangerousEnemyMonster.coords, enemyBaseCoords),
+                       distBetweenUnitAndMonster = dist(mostDangerousEnemyMonster.coords, our[Attacker].coords);
+
+                // пытаемся навесить щит
+                if (mostDangerousEnemyMonster.needShield
+                    && distBetweenUnitAndMonster < 2200.
+                    && !mostDangerousEnemyMonster.shieldLife) {
+                    actions[Attacker] = { "SPELL SHILD", enemyBaseCoords.x, enemyBaseCoords.y };
+                }
+                // пытаемся задувать монстра вглубь базы врага
+                else if (mostDangerousEnemyMonster.needWind
+                    && monsterDistToEnemyBase < attackerDistToBase // если монстр БЛИЖЕ к базе чем ATTACKER
+                    && distBetweenUnitAndMonster < cHalfWindDistance // и ветерок заденет монстра
+                    && !mostDangerousEnemyMonster.shieldLife) { // нет смысла сдувать монстров с щитом
+                        actions[Attacker] = { "SPELL WIND", enemyBaseCoords.x, enemyBaseCoords.y };
+                }
+                // иначе идем монстру за спину, чтобы потом его сдуть
+                else {
+                    actions[Attacker] = { "MOVE",
+                        mostDangerousEnemyMonster.coords.x - static_cast<int>(ceil(mostDangerousEnemyMonster.vx * 1.5)),
+                        mostDangerousEnemyMonster.coords.y - static_cast<int>(ceil(mostDangerousEnemyMonster.vy * 1.5)) };
+                }
+            }
+            // если для атакера нет подходящих целей, надо их поискать
+            else {
+                // атакер должен быть всегда в радиусе 6500 от базы врага
+                if (attackerCurrentTargetPos == -1) {
+                    attackerCurrentTargetPos = 0;
+                }
+                if ((our[Attacker].coords.x == attackCoordsVec[0].x)
+                    && (our[Attacker].coords.y == attackCoordsVec[0].y)) {
+                    attackerCurrentTargetPos = 1;
+                }
+                else if ((our[Attacker].coords.x == attackCoordsVec[1].x)
+                    && (our[Attacker].coords.y == attackCoordsVec[1].y)) {
+                    attackerCurrentTargetPos = 0;
+                }
+                actions[Attacker] = { "MOVE", attackCoordsVec[attackerCurrentTargetPos].x, attackCoordsVec[attackerCurrentTargetPos].y };
+            }
+        }
+
+        // формируем ход для FARMER
+        {
+            /*
+            // если есть цели для фарминга
+            if (isFarmerBusy) {
+                farmerCurrentTargetPos = -1;
+                // наилучший монстр для фарминга или враг для дефа
+                const Entity& bestEntity = monstersToFarmingAndEnemyUnits.front();
 
                 // если юнит ближе к базе чем монстр И дальность до монстра меньша дальности ветерка И дальность от базы < 7500 (обдумать эвристику)
                 // то пытаемся выдувать монстра подальше
-                double bestUnitDistToBase = dist(our[bestOurUnitId].coords, baseCoords),
-                       monsterDistToBase = dist(monster.coords, baseCoords),
-                       distBetweenUnitAndMonster = dist(monster.coords, our[bestOurUnitId].coords);
+                double farmerDistToBase = dist(our[Farmer].coords, ourBaseCoords),
+                    bestEntityToBase = dist(bestEntity.coords, ourBaseCoords),
+                    distBetweenOurAndEntity = dist(bestEntity.coords, our[Farmer].coords);
 
                 // отдельно обрабатываем кейс с контром врага
-                if (monster.type == Enemy && bases.ourBase.mana > 10 && !monster.shieldLife) {
-                    // cerr << "Monster type Enemy" << endl;
-                    // cerr << "\tEnemy dangerous entity, bestUnitDistToBase:" << bestUnitDistToBase << ", monsterDistToBase:" << monsterDistToBase << endl;
-                    // cerr << "\t\tdistBetweenUnitAndMonster:" << distBetweenUnitAndMonster << endl;
-                    if (distBetweenUnitAndMonster < cHalfWindWide) {
-                        actions[bestOurUnitId] = { "SPELL WIND", enemyBaseCoords.x, enemyBaseCoords.y };
+                if (bestEntity.type == Enemy && bases.ourBase.mana > 10 && !bestEntity.shieldLife) {
+                    if (distBetweenOurAndEntity < cHalfWindWidth) {
+                        actions[Farmer] = { "SPELL WIND", enemyBaseCoords.x, enemyBaseCoords.y };
                     }
                     // иначе идем с опережением врага
                     else {
-                        actions[bestOurUnitId] = { "MOVE", monster.coords.x + monster.vx, monster.coords.y + monster.vy };
+                        actions[Farmer] = { "MOVE", bestEntity.coords.x + bestEntity.vx, bestEntity.coords.y + bestEntity.vy };
                     }
                 }
-                // обрабатываем монстров
-                else if (bestUnitDistToBase < monsterDistToBase + cHalfWindWide // если наш юнит БЛИЖЕ к базе чем монстр на половину каста ветерка
-                    && distBetweenUnitAndMonster < cHalfWindWide
-                    && monsterDistToBase < getWindCastAllowRadius()
-                    && !monster.shieldLife // нет смысла сдувать монстров с щитом
-                    && neededUnitIdx == 0 // сдувом будет заниматься только ближайший юнит
-                    ) {
+                // если это паук или нет маны на деф вражеского пушера
+                else {
+                    actions[Farmer] = { "MOVE", bestEntity.coords.x + bestEntity.vx, bestEntity.coords.y + bestEntity.vy };
+                }
+            }
+            // если некого фармить - идем на дефолтную позицию ожидания
+            // важно запонмить таргет фармера, чтобы дефендер знал куда идти в случае бездействия
+            else {
+                if (farmerCurrentTargetPos == -1) {
+                    farmerCurrentTargetPos = 0;
+                }
+                if (   (our[Farmer].coords.x == farmCoordVec[0].x)
+                    && (our[Farmer].coords.y == farmCoordVec[0].y)) {
+                    farmerCurrentTargetPos = 1;
+                }
+                else if ((our[Farmer].coords.x == farmCoordVec[1].x)
+                    && (our[Farmer].coords.y == farmCoordVec[1].y)) {
+                    farmerCurrentTargetPos = 0;
+                }
+                actions[Farmer] = { "MOVE", farmCoordVec[farmerCurrentTargetPos].x, farmCoordVec[farmerCurrentTargetPos].y };
+            }
+            */
+
+            if (isFarmerBusy)
+            {
+                farmerCurrentTargetPos = -1;
+                // 2-й по опасности монстр
+                const Entity& dangerousMonster = ourDangerousMonsters[1];
+
+                // если Farmer ближе к базе чем монстр И дальность до монстра меньша дальности ветерка И дальность от базы < 7500 (обдумать эвристику)
+                // то пытаемся выдувать монстра подальше
+                double farmerDistToBase = dist(our[Farmer].coords, ourBaseCoords),
+                    monsterDistToBase = dist(dangerousMonster.coords, ourBaseCoords),
+                    distBetweenUnitAndMonster = dist(dangerousMonster.coords, our[Farmer].coords);
+
+                if (farmerDistToBase < monsterDistToBase + cHalfWindWidth // если Farmer БЛИЖЕ к базе чем монстр на половину каста ветерка
+                    && distBetweenUnitAndMonster < cHalfWindWidth // и ветерок заденет монстра
+                    && monsterDistToBase < cBaseRadius
+                    && !dangerousMonster.shieldLife) { // нет смысла сдувать монстров с щитом
                     // cerr << "Monster type Monster, can cast WIND" << endl;
-                    actions[bestOurUnitId] = { "SPELL WIND", enemyBaseCoords.x, enemyBaseCoords.y };
+                    actions[Farmer] = { "SPELL WIND", enemyBaseCoords.x, enemyBaseCoords.y };
                 }
                 // иначе идем с опережением монстра
                 else {
-                    // cerr << "Monster type Monster, go forward him: MOVE " << monster.coords.x + monster.vx << ", " << monster.coords.y + monster.vy << endl;
-                    actions[bestOurUnitId] = { "MOVE", monster.coords.x + monster.vx, monster.coords.y + monster.vy };
-                }
-
-                // удаляем выбранного юнита из доступных для хода
-                eraseFromVecUnitId(bestOurUnitId, our);
-
-                if (our.empty()) break;
-            }
-            if (our.empty()) break;
-        }
-        // cerr << "Dangerous processed" << endl;
-
-        if (our.size()) {
-
-            // если есть неопасные монстры - идем фармить
-            if (undangerousMonsters.size()) {
-
-                for (const Entity& undangerousMonster: undangerousMonsters) {
-                    // ищем ближайшего юнита к данному монстру
-                    int bestOurUnitId = convertToArrayIdx(getIdxOfNearestUnits(undangerousMonster.coords, our));
-
-                    // добавляем команду на атаку ближайшим юнитом этого монстра
-                    actions[bestOurUnitId] = { "MOVE", undangerousMonster.coords.x + undangerousMonster.vx, undangerousMonster.coords.y + undangerousMonster.vy };
-
-                    /*
-                    // если юнит ближе к базе чем монстр И дальность до монстра меньша дальности ветерка И дальность от базы < 7500 (обдумать эвристику)
-                    // то пытаемся выдувать монстра подальше
-                    double bestUnitDistToBase = dist(our[bestOurUnitId].coords, baseCoords),
-                        monsterDistToBase = dist(undangerousMonster.coords, baseCoords),
-                        distBetweenUnitAndMonster = dist(undangerousMonster.coords, our[bestOurUnitId].coords);
-                    if (bestUnitDistToBase < monsterDistToBase + cHalfWindWide
-                        && distBetweenUnitAndMonster < cHalfWindWide
-                        && monsterDistToBase < 6000.) {
-                        actions[bestOurUnitId] = { "SPELL WIND", enemyBaseCoords.x, enemyBaseCoords.y };
-                    }
-                    // иначе идем с опережением монстра
-                    else {
-                        actions[bestOurUnitId] = { "MOVE", undangerousMonster.coords.x + undangerousMonster.vx, undangerousMonster.coords.y + undangerousMonster.vy };
-                    }
-                    */
-
-                    eraseFromVecUnitId(bestOurUnitId, our);
-                    if (our.empty()) break;
+                    // cerr << "Monster type Monster, go forward him: MOVE " << dangerousMonster.coords.x + dangerousMonster.vx << ", " << dangerousMonster.coords.y + dangerousMonster.vy << endl;
+                    actions[Farmer] = { "MOVE", dangerousMonster.coords.x + dangerousMonster.vx, dangerousMonster.coords.y + dangerousMonster.vy };
                 }
             }
-            // cerr << "Undangerous processed" << endl;
-
-            // cerr << "Creating wait actions for " << our.size() << " our units" << endl;
-            for (int i = 0; i < our.size(); i++) {
-                actions[convertToArrayIdx(our[i].id)] = { "MOVE", waitCoordsVec2[our.size() - 1][i].x, waitCoordsVec2[our.size() - 1][i].y };
+            // идем на противоположную позицию фарма от фермера
+            // либо на 1-ю дефолтную позицию для фарма
+            else {
+                if (farmerCurrentTargetPos == -1) {
+                    farmerCurrentTargetPos = 0;
+                }
+                if ((our[Farmer].coords.x == farmCoordVec[0].x)
+                    && (our[Farmer].coords.y == farmCoordVec[0].y)) {
+                    farmerCurrentTargetPos = 1;
+                }
+                else if ((our[Farmer].coords.x == farmCoordVec[1].x)
+                    && (our[Farmer].coords.y == farmCoordVec[1].y)) {
+                    farmerCurrentTargetPos = 0;
+                }
+                actions[Farmer] = { "MOVE", farmCoordVec[farmerCurrentTargetPos].x, farmCoordVec[farmerCurrentTargetPos].y };
             }
         }
-        // cerr << "Actions ready" << endl;
+
+        // формируем ход для DEFENDER
+        {
+            if (isDefenderBusy)
+            {
+                defenderCurrentTargetPos = -1;
+                // самый опасный монстр
+                const Entity& mostDangerousMonster = ourDangerousMonsters.front();
+
+                // если DEFENDER ближе к базе чем монстр И дальность до монстра меньша дальности ветерка И дальность от базы < 7500 (обдумать эвристику)
+                // то пытаемся выдувать монстра подальше
+                double defenderDistToBase = dist(our[Defender].coords, ourBaseCoords),
+                    monsterDistToBase = dist(mostDangerousMonster.coords, ourBaseCoords),
+                    distBetweenUnitAndMonster = dist(mostDangerousMonster.coords, our[Defender].coords);
+
+                if (defenderDistToBase < monsterDistToBase + cHalfWindWidth // если DEFENDER БЛИЖЕ к базе чем монстр на половину каста ветерка
+                    && distBetweenUnitAndMonster < cHalfWindWidth // и ветерок заденет монстра
+                    && monsterDistToBase < cBaseRadius
+                    && !mostDangerousMonster.shieldLife) { // нет смысла сдувать монстров с щитом
+                    // cerr << "Monster type Monster, can cast WIND" << endl;
+                    actions[Defender] = { "SPELL WIND", enemyBaseCoords.x, enemyBaseCoords.y };
+                }
+                // иначе идем с опережением монстра
+                else {
+                    // cerr << "Monster type Monster, go forward him: MOVE " << mostDangerousMonster.coords.x + mostDangerousMonster.vx << ", " << mostDangerousMonster.coords.y + mostDangerousMonster.vy << endl;
+                    actions[Defender] = { "MOVE", mostDangerousMonster.coords.x + mostDangerousMonster.vx, mostDangerousMonster.coords.y + mostDangerousMonster.vy };
+                }
+            }
+            // если дефендеру нечего делать - присоединяемся к фермеру
+            // else if (monstersToFarmingAndEnemyUnits.size() >= 2) {
+            //     // монстр-таргет для фарминга сделаем ближайшим к дефендеру
+            //     int bestTargetToFarmIdx = -1;
+            //     double bestTargetDist = cMaxDist;
+            //     for (int i = 1; i < monstersToFarmingAndEnemyUnits.size(); i++) {
+            //         double distBetweenDefenderAndMonster = dist(monstersToFarmingAndEnemyUnits[i].coords, our[Defender].coords);
+            //         if (distBetweenDefenderAndMonster < bestTargetDist) {
+            //             bestTargetDist = distBetweenDefenderAndMonster;
+            //             bestTargetToFarmIdx = i;
+            //         }
+            //     }
+            //     // после определения лучшего таргета - атакуем
+            //     const Entity& bestTargetMonster = monstersToFarmingAndEnemyUnits[bestTargetToFarmIdx];
+            //     actions[Defender] = { "MOVE", bestTargetMonster.coords.x + bestTargetMonster.vx, bestTargetMonster.coords.y + bestTargetMonster.vy };
+            // }
+            // если и фармить некого - идем на противоположную позицию фарма от фермера
+            // либо на 1-ю дефолтную позицию для фарма
+            else {
+                if (defenderCurrentTargetPos == -1) {
+                    defenderCurrentTargetPos = 0;
+                }
+                else {
+                    defenderCurrentTargetPos = 1;
+                }
+
+                if ((our[Defender].coords.x == farmCoordVec[0].x)
+                    && (our[Defender].coords.y == farmCoordVec[0].y)) {
+                    defenderCurrentTargetPos = 1;
+                }
+                else if ((our[Defender].coords.x == farmCoordVec[1].x)
+                    && (our[Defender].coords.y == farmCoordVec[1].y)) {
+                    defenderCurrentTargetPos = 0;
+                }
+                actions[Defender] = { "MOVE", farmCoordVec[defenderCurrentTargetPos].x, farmCoordVec[defenderCurrentTargetPos].y };
+            }
+        }
+
+        }
 
         return actions;
     }
 
-    vector<vector<Coord>> getWaitCoords() {
-        static const double defendRadiusCoef = 1.3;
-
-        // cerr << "Base coords: " << baseCoords.x << " " << baseCoords.y << endl;
-
+    vector<Coord> getFarmDefaultCoords() {
+        static const double farmRadiusCoef = 1.4;
         return {
-            vector<Coord> {
-                Coord{  abs(baseCoords.x - static_cast<int>(ceil(cBaseRadius * defendRadiusCoef * cos(45. * M_PI / 180.)))),
-                        abs(baseCoords.y - static_cast<int>(ceil(cBaseRadius * defendRadiusCoef * sin(45. * M_PI / 180.)))) }
-            },
-            vector<Coord> {
-                Coord{  abs(baseCoords.x - static_cast<int>(ceil(cBaseRadius * defendRadiusCoef * cos(20. * M_PI / 180.)))),
-                        abs(baseCoords.y - static_cast<int>(ceil(cBaseRadius * defendRadiusCoef * sin(20. * M_PI / 180.)))) },
-                Coord{  abs(baseCoords.x - static_cast<int>(ceil(cBaseRadius * defendRadiusCoef * cos(70. * M_PI / 180.)))),
-                        abs(baseCoords.y - static_cast<int>(ceil(cBaseRadius * defendRadiusCoef * sin(70. * M_PI / 180.)))) }
-            },
-            vector<Coord> {
-                Coord{  abs(baseCoords.x - static_cast<int>(ceil(cBaseRadius * defendRadiusCoef * cos(20. * M_PI / 180.)))),
-                        abs(baseCoords.y - static_cast<int>(ceil(cBaseRadius * defendRadiusCoef * sin(20. * M_PI / 180.)))) },
-                Coord{  abs(baseCoords.x - static_cast<int>(ceil(cBaseRadius * defendRadiusCoef * cos(45. * M_PI / 180.)))),
-                        abs(baseCoords.y - static_cast<int>(ceil(cBaseRadius * defendRadiusCoef * sin(45. * M_PI / 180.)))) },
-                Coord{  abs(baseCoords.x - static_cast<int>(ceil(cBaseRadius * defendRadiusCoef * cos(70. * M_PI / 180.)))),
-                        abs(baseCoords.y - static_cast<int>(ceil(cBaseRadius * defendRadiusCoef * sin(70. * M_PI / 180.)))) }
-            }   
+            Coord{  abs(ourBaseCoords.x - static_cast<int>(ceil(cBaseRadius * farmRadiusCoef * cos(20. * M_PI / 180.)))),
+                    abs(ourBaseCoords.y - static_cast<int>(ceil(cBaseRadius * farmRadiusCoef * sin(20. * M_PI / 180.)))) },
+            Coord{  abs(ourBaseCoords.x - static_cast<int>(ceil(cBaseRadius * farmRadiusCoef * cos(70. * M_PI / 180.)))),
+                    abs(ourBaseCoords.y - static_cast<int>(ceil(cBaseRadius * farmRadiusCoef * sin(70. * M_PI / 180.)))) }
+        };
+    }
+
+    vector<Coord> getAttackDefaultCoords() {
+        static const double attackRadiusCoef = 1.3;
+        /*
+        cerr << "Enemy base coords: " << enemyBaseCoords.x << ", " << enemyBaseCoords.y << endl;
+        cerr << "\t\tcoords1 dx: " << static_cast<int>(ceil(cBaseRadius * attackRadiusCoef * cos(20. * M_PI / 180.))) << ", "
+                         << "dy: " << static_cast<int>(ceil(cBaseRadius * attackRadiusCoef * sin(20. * M_PI / 180.))) << endl;
+        cerr << "\t\tcoords2 dx: " << static_cast<int>(ceil(cBaseRadius * attackRadiusCoef * cos(70. * M_PI / 180.))) << ", "
+                         << "dy: " << static_cast<int>(ceil(cBaseRadius * attackRadiusCoef * sin(70. * M_PI / 180.))) << endl;
+        */
+        return {
+            Coord{  abs(enemyBaseCoords.x - static_cast<int>(ceil(cBaseRadius * attackRadiusCoef * cos(20. * M_PI / 180.)))),
+                    abs(enemyBaseCoords.y - static_cast<int>(ceil(cBaseRadius * attackRadiusCoef * sin(20. * M_PI / 180.)))) },
+            Coord{  abs(enemyBaseCoords.x - static_cast<int>(ceil(cBaseRadius * attackRadiusCoef * cos(70. * M_PI / 180.)))),
+                    abs(enemyBaseCoords.y - static_cast<int>(ceil(cBaseRadius * attackRadiusCoef * sin(70. * M_PI / 180.)))) }
         };
     }
 } entities;
@@ -355,7 +568,7 @@ int main() {
         entities.read();
 
         auto startTime = std::chrono::high_resolution_clock::now();
-        for (const Action& action : entities.updateDangerousMonsters()) {
+        for (const Action& action : entities.prepairActions()) {
             cout << action.action << " " << action.val1;
             if (action.val2 != -1 || action.action == "MOVE") cout << " " << action.val2;
             if (action.val3 != -1) cout << " " << action.val3;
