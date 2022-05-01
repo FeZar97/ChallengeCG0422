@@ -538,6 +538,8 @@ struct Entities {
         for (int simulationDepth = 0; simulationDepth < cMaxSimulationDepth; simulationDepth++) {
             for (Entity& monster : monsters) {
 
+                double initialDistanceToOurBase = dist(monster.coords, ourBaseCoords);
+
                 // симулируем координаты монстра и учитываем его дистанции
                 monster.simulatedCoords.x += monster.vx;
                 monster.simulatedCoords.y += monster.vy;
@@ -572,6 +574,7 @@ struct Entities {
                     // ОПАСНЫЕ ДЛЯ НАШЕЙ БАЗЫ
                     // если по результатам симуляции монстр дошел до базы - считаем его опасным
                     if (curDistToOurBase < cBaseRadius + 1500.
+                        && initialDistanceToOurBase < cMaxDist / 2.
                         && monster.baseRadiusReachCoord.x >= 0 && monster.baseRadiusReachCoord.x <= cMaxCoord.x  // валидность координат
                         && monster.baseRadiusReachCoord.y >= 0 && monster.baseRadiusReachCoord.y <= cMaxCoord.y) // валидность координат
                     {
