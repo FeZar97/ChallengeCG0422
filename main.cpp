@@ -37,14 +37,14 @@ const int cMonsterSpeed = 400;
 const int cUnitSpeed = 800;
 const int cUnitDamage = 2;
 int turnCnt = 0;
-const int cFarmingPeriod = 105; // количество ходов в начале игры, в течение которого фармим
+const int cFarmingPeriod = 115; // количество ходов в начале игры, в течение которого фармим
 const double cBaseAttackRadius = 300.;
 const int cMaxTurnIdx = 219;
-const int cHardGameBeginTurn = 105;
+const int cTurnWhileEnemyAtackerIsNotImportnant = 55;
 const int cWindSpellRadius = 1280;
 const int cWindDistance = 2200;
 const int cHalfWindDistance = cWindDistance / 2;
-const int cMaxSimulationDepth = 35;
+const int cMaxSimulationDepth = 45;
 const double cHeroVisibleAreaRadius = 2200.;
 const double cDangerousDistanceThreshold = 12000.; // порог криволинейного расстояния до нашей базы, после которого монстр считается ОПАСНЫМ для нас
 const double cDangerousDistanceEnemyThreshold = 7500.;
@@ -115,26 +115,10 @@ void eraseFromVecUnitId(int id, vector<Entity>& vec) {
     }
 }
 int getWindCastAllowRadius() {
-    return 5000; // +1000 * bases.ourBase.mana / 40;
+    return 4500; // +1000 * bases.ourBase.mana / 40;
 }
 bool isEntityInCoord(const Entity& entity, const Coord& coord, int availableRaius = 0) {
     return dist(entity.coords, coord) < (2 + availableRaius);
-}
-double getEntityAlphaToCoords(const Entity& entity, const Coord& coord) {
-    double dx = abs(coord.x - entity.coords.x),
-        dy = abs(coord.y - entity.coords.y),
-        _dist = dist(coord, entity.coords);
-    return 0;
-}
-double getMinDistanceToEntity(const Entity& target, const vector<Entity>& someEnteties) {
-    double minDist = cMaxDist;
-    for (const Entity& someEnt : someEnteties) {
-        double curDist = dist(someEnt.coords, target.coords);
-        if (curDist < minDist) {
-            minDist = curDist;
-        }
-    }
-    return minDist;
 }
 Entity* getEntityById(vector<Entity>& someEnteties, int targetId) {
     for (Entity& ent : someEnteties) {
@@ -399,7 +383,7 @@ struct Entities {
         cerr << "Attacker can not protect any monster by shield" << endl;
         return nullopt;
     }
-    optional<Action> tryAttackerStartFarming() {
+    optional<Action> tryAttackerStartFarming(vector<Entity>& ourDangerousMonsters) {
         if (turnCnt > cFarmingPeriod) {
             return nullopt;
         }
@@ -410,10 +394,25 @@ struct Entities {
         // (того расстояния, на котором монсстр считается опасным для нашей базы)
         double minDistToMonster = cMaxDist;
         Entity* bestEntToAttack = nullptr;
-        for (Entity& ent : monsters) {
-            if (dist(ent.coords, our[Attacker].coords) < minDistToMonster) {
+
+        // сначала ищем среди опасных для нашей базы
+        for (Entity& ent : ourDangerousMonsters) {
+            if (dist(ent.coords, our[Attacker].coords) < minDistToMonster
+                && dist(ent.coords, ourBaseCoords) > 9000.
+                ) {
                 minDistToMonster = dist(ent.coords, our[Attacker].coords);
                 bestEntToAttack = &ent;
+            }
+        }
+        // затем по необходимости пробежимся по всем остальным мобам
+        if (!bestEntToAttack) {
+            for (Entity& ent : monsters) {
+                if (dist(ent.coords, our[Attacker].coords) < minDistToMonster
+                    && dist(ent.coords, ourBaseCoords) > 9000.
+                    ) {
+                    minDistToMonster = dist(ent.coords, our[Attacker].coords);
+                    bestEntToAttack = &ent;
+                }
             }
         }
 
@@ -437,10 +436,10 @@ struct Entities {
         return Action{ "MOVE", attackerFarmCoordVec[attackerFarmingCurPos].x, attackerFarmCoordVec[attackerFarmingCurPos].y };
     }
    
-    void getAttackerAction(Actions& actions, vector<Entity>& enemyDangerousMonsters) {
+    void getAttackerAction(Actions& actions, vector<Entity>& ourDangerousMonsters, vector<Entity>& enemyDangerousMonsters) {
         double attackerDistToBase = dist(our[Attacker].coords, enemyBaseCoords);
 
-        if (auto act = tryAttackerStartFarming(); act.has_value()) {
+        if (auto act = tryAttackerStartFarming(ourDangerousMonsters); act.has_value()) {
             actions[Attacker] = act.value();
             return;
         }
@@ -663,9 +662,17 @@ struct Entities {
         cerr << "\t\t Dangerous Monsters size: " << ourDangerousMonsters.size() << endl;
         cerr << "\t\t Enemy Attacker size: " << enemyAttackers.size() << endl;
 
+
         isHighThreatment = false;
+        if (enemyAttackers.size() == 0 || turnCnt < cTurnWhileEnemyAtackerIsNotImportnant)
+        {
+            // если атакеров нет, то играем дефолтно
+            tryDefendersAttackDangerousMonster(actions, ourAvailableUnits, ourDangerousMonsters);
+            tryDefendersFarming(actions, ourAvailableUnits, ourMonstersToFarming);
+            tryDefendersWaiting(actions, ourAvailableUnits);
+        }
         // если базу атакует 2 или 3 вражеских юнита - идем в жесткий деф
-        if (enemyAttackers.size() >= 2) {
+        else if (enemyAttackers.size() >= 2) {
             isHighThreatment = true;
             // если базу атакует 2 или 3 вражеских юнита - идем в жесткий деф
             // при этом атакер должен максимально быстро запушить монстров к врагу в радиус базы
@@ -832,13 +839,6 @@ struct Entities {
                     tryDefendersWaiting(actions, ourAvailableUnits);
                 }
             }
-        }
-        // если вражеских атакеров нет
-        else {
-            // если атакеров нет, то играем дефолтно
-            tryDefendersAttackDangerousMonster(actions, ourAvailableUnits, ourDangerousMonsters);
-            tryDefendersFarming(actions, ourAvailableUnits, ourMonstersToFarming);
-            tryDefendersWaiting(actions, ourAvailableUnits);
         }
     }
 
@@ -1039,7 +1039,7 @@ struct Entities {
         // формируем ходы
         Actions actions; actions.resize(3);
 
-        getAttackerAction(actions, enemyDangerousMonsters);
+        getAttackerAction(actions, ourDangerousMonsters, enemyDangerousMonsters);
 
         vector<Entity> ourAvailableUnits = { our[Defender], our[Farmer] };
         getDefendersActions(actions, ourAvailableUnits, ourDangerousMonsters, enemyAttackers, ourMonstersToFarming);
